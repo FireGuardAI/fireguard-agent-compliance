@@ -11,7 +11,7 @@ clause).
 - [x] **Step 1** — FastAPI skeleton, config/logger/exceptions, `/health`,
       Dockerized + joined to `fireguard-vector-store`'s Docker network
 - [x] **Step 2** — Retrieval client (`httpx` + real `tenacity` retries), `/health/retrieval`
-- [ ] Step 3 — Compliance engine (Gemini integration)
+- [x] **Step 3** — Compliance engine (Gemini integration), `/health/gemini`
 - [ ] Step 4 — `/api/v1/audit` endpoint
 - [ ] Step 5 — Production hardening (optional)
 
@@ -95,3 +95,33 @@ Expected:
 If it returns `503`, check `fireguard-agent-retrieval` is actually
 running on the same Docker network (`docker ps`, `docker network
 inspect fireguard-vector-store_fireguard-net`).
+
+## Step 3 — Compliance engine (Gemini)
+
+`app/services/compliance_engine.py` — fixes two reference-doc bugs:
+
+1. **Import-time instantiation** (`engine = ComplianceEngine()` at module
+   load) meant a missing/bad API key crashed the app before it could
+   report a clean error. Now built in the startup event, like every
+   other service here.
+2. **`tenacity` was listed as a dependency but never used.** Now the
+   actual Gemini API call retries transient failures (rate limits,
+   network errors) with exponential backoff.
+
+Response parsing is defensive: `json.loads()` and the Pydantic
+`ComplianceResponse` validation are both wrapped, raising a clean
+`LLMResponseParsingError` instead of an uncaught crash if Gemini's
+output isn't valid JSON or doesn't match the schema.
+
+```powershell
+docker compose up -d --build
+curl.exe http://localhost:8002/health/gemini
+```
+
+Expected:
+```json
+{"status":"ok","model":"gemini-1.5-flash"}
+```
+
+This makes one real (tiny) Gemini API call — don't script it into a
+tight polling loop, Gemini's free tier is rate-limited.
