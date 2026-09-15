@@ -1,14 +1,3 @@
-"""Client for fireguard-agent-retrieval — fetches relevant fire
-regulation chunks for a compliance query.
-
-Retries transient failures (timeouts, connection errors, 5xx responses)
-with exponential backoff via tenacity. The reference doc listed tenacity
-as a dependency but never actually used it anywhere — this fixes that.
-
-4xx responses are NOT retried — retrying a malformed/rejected request
-forever wastes time on a problem retries can't fix; those fail
-immediately with a clear error instead.
-"""
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -31,8 +20,6 @@ class RetrievalClient:
         logger.info(f"RetrievalClient targeting {self._base_url}")
 
     async def health_check(self) -> dict:
-        """Used by /health/retrieval — confirms the retrieval agent
-        itself is reachable and reports healthy."""
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.get(f"{self._base_url}/health")
@@ -64,8 +51,6 @@ class RetrievalClient:
                 f"retrieval agent returned {response.status_code}"
             )
         if response.status_code >= 400:
-            # client error — the request itself is the problem, retrying
-            # won't help, fail immediately with a clear message
             raise RetrievalClientError(
                 f"Retrieval agent rejected request: "
                 f"{response.status_code} {response.text}"
