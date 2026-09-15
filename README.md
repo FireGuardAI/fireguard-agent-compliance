@@ -10,7 +10,7 @@ clause).
 
 - [x] **Step 1** — FastAPI skeleton, config/logger/exceptions, `/health`,
       Dockerized + joined to `fireguard-vector-store`'s Docker network
-- [ ] Step 2 — Retrieval client (calls fireguard-agent-retrieval, with real retries)
+- [x] **Step 2** — Retrieval client (`httpx` + real `tenacity` retries), `/health/retrieval`
 - [ ] Step 3 — Compliance engine (Gemini integration)
 - [ ] Step 4 — `/api/v1/audit` endpoint
 - [ ] Step 5 — Production hardening (optional)
@@ -70,3 +70,28 @@ folder name needs to match what's in `docker-compose.yml`'s `networks:`
 section.
 
 Port `8002` — `8000` is ChromaDB, `8001` is `fireguard-agent-retrieval`.
+
+## Step 2 — Retrieval client
+
+`app/services/retrieval_client.py` calls `fireguard-agent-retrieval`'s
+`/api/v1/retrieve` endpoint, with `tenacity`-based exponential-backoff
+retries — but **only** for transient failures (timeouts, connection
+errors, 5xx responses). A 4xx response fails immediately without
+retrying, since retrying a rejected request can't fix it.
+
+**Prerequisite:** `fireguard-agent-retrieval` must be running (Steps 1-5
+of that repo) for `/health/retrieval` to succeed.
+
+```powershell
+docker compose up -d --build
+curl.exe http://localhost:8002/health/retrieval
+```
+
+Expected:
+```json
+{"status":"ok","retrieval_agent":{"status":"ok","service":"FireGuard Retrieval Agent"}}
+```
+
+If it returns `503`, check `fireguard-agent-retrieval` is actually
+running on the same Docker network (`docker ps`, `docker network
+inspect fireguard-vector-store_fireguard-net`).
