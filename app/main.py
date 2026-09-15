@@ -1,15 +1,14 @@
-"""FastAPI application entry point.
-
-Grows as each build step wires in a new service — retrieval client
-(Step 2), Gemini compliance engine (Step 3), the fused /audit endpoint
-(Step 4). See README.md's build-status checklist for what's done.
-"""
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app.config import settings
 from app.exceptions import ComplianceEngineError, LLMResponseParsingError, RetrievalClientError
 from app.logger import get_logger
+from app.middleware import RequestLoggingMiddleware
 from app.schemas import AuditRequest, ComplianceResponse
 from app.services.compliance_engine import ComplianceEngine
 from app.services.retrieval_client import RetrievalClient
@@ -24,24 +23,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLoggingMiddleware)
 
-# Loaded once at startup (see on_startup below), never per-request.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
 retrieval_client: RetrievalClient | None = None
 compliance_engine: ComplianceEngine | None = None
 
 
 @app.get("/health")
 async def health() -> dict:
-    """Basic liveness check — confirms the API process itself is up.
-    Does NOT check the retrieval agent or Gemini; those get their own
-    /health/retrieval and /health/gemini checks in Steps 2 and 3."""
     return {"status": "ok", "service": settings.api_title}
 
 
 @app.get("/health/retrieval")
 async def health_retrieval() -> dict:
-    """Proves fireguard-agent-retrieval is actually reachable — not just
-    that the client object was constructed."""
     if retrieval_client is None:
         raise HTTPException(
             status_code=503, detail="Retrieval client not initialized"
@@ -55,9 +60,6 @@ async def health_retrieval() -> dict:
 
 @app.get("/health/gemini")
 async def health_gemini() -> dict:
-    """Makes one real (minimal) Gemini API call to prove the API key and
-    model actually work. Not polled automatically — call it manually,
-    it costs a tiny sliver of free-tier quota each time."""
     if compliance_engine is None:
         raise HTTPException(
             status_code=503, detail="Compliance engine not initialized"
@@ -69,21 +71,49 @@ async def health_gemini() -> dict:
     return {"status": "ok", "model": settings.gemini_model_name}
 
 
+@app.get("/health/all")
+async def health_all() -> dict:
+    dependencies: dict = {}
+    overall_ok = True
+
+    if retrieval_client is None:
+        dependencies["retrieval"] = {"status": "error", "detail": "not initialized"}
+        overall_ok = False
+    else:
+        try:
+            dependencies["retrieval"] = {
+                "status": "ok",
+                "detail": await retrieval_client.health_check(),
+            }
+        except RetrievalClientError as exc:
+            dependencies["retrieval"] = {"status": "error", "detail": str(exc)}
+            overall_ok = False
+
+    if compliance_engine is None:
+        dependencies["gemini"] = {"status": "error", "detail": "not initialized"}
+        overall_ok = False
+    else:
+        try:
+            await compliance_engine.self_check()
+            dependencies["gemini"] = {"status": "ok"}
+        except ComplianceEngineError as exc:
+            dependencies["gemini"] = {"status": "error", "detail": str(exc)}
+            overall_ok = False
+
+    return {"status": "ok" if overall_ok else "degraded", "dependencies": dependencies}
+
+
 @app.post("/api/v1/audit", response_model=ComplianceResponse)
-async def run_compliance_audit(request: AuditRequest) -> ComplianceResponse:
-    """Fetches relevant regulations and asks Gemini for a compliance
-    verdict. Each failure mode gets its own status code and a clean
-    message — the reference doc caught every possible failure with one
-    blanket `except Exception: raise HTTPException(500, str(e))`, which
-    leaked raw internal exception text and couldn't distinguish "our
-    retrieval agent is down" from "Gemini returned garbage" from
-    "nothing relevant was found"."""
+@limiter.limit(settings.audit_rate_limit)
+async def run_compliance_audit(
+    request: Request, audit_request: AuditRequest
+) -> ComplianceResponse:
     if retrieval_client is None or compliance_engine is None:
         raise HTTPException(status_code=503, detail="Services not initialized")
 
     query = (
-        f"Fire regulations for {request.building_details.building_type} "
-        f"with {request.building_details.number_of_floors} floors"
+        f"Fire regulations for {audit_request.building_details.building_type} "
+        f"with {audit_request.building_details.number_of_floors} floors"
     )
 
     try:
@@ -101,7 +131,7 @@ async def run_compliance_audit(request: AuditRequest) -> ComplianceResponse:
 
     try:
         return await compliance_engine.analyze(
-            building_info=request.building_details.model_dump(),
+            building_info=audit_request.building_details.model_dump(),
             retrieved_chunks=retrieved_chunks,
         )
     except LLMResponseParsingError as exc:

@@ -1,10 +1,3 @@
-"""Pydantic request/response models for the compliance API.
-
-Bounds added beyond the reference doc's schemas: compliance_score is
-constrained to 0-100 (was an unbounded float) and number_of_floors must
-be positive — cheap validation that catches obviously-wrong LLM output
-or bad input before it ever reaches a client.
-"""
 from typing import Optional
 
 from pydantic import BaseModel, Field

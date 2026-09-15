@@ -1,20 +1,4 @@
-"""Gemini-based compliance reasoning engine.
-
-Uses the current `google-genai` SDK — NOT the deprecated `google-
-generativeai` package this file originally used. The new SDK accepts a
-Pydantic model directly as `response_schema`, which makes Gemini
-actually CONFORM to ComplianceResponse's shape (every required field
-present), rather than relying on prompt instructions alone and hoping.
-
-This fixes a real failure hit in testing: with only prompt-level
-guidance, Gemini returned a partial object (just `overall_status`) when
-it decided the answer was "insufficient data" — dropping
-compliance_score/detailed_checks/summary entirely. Schema-enforced
-output can't do that; the SDK validates the shape server-side.
-
-Retries transient Gemini API failures (rate limits, transient network
-errors) with exponential backoff via tenacity.
-"""
+import asyncio
 import json
 
 from google import genai
@@ -47,17 +31,16 @@ class ComplianceEngine:
         reraise=True,
     )
     async def _generate(self, prompt: str):
-        return await self._client.aio.models.generate_content(
-            model=self._model_name,
-            contents=prompt,
-            config=self._generation_config,
+        return await asyncio.wait_for(
+            self._client.aio.models.generate_content(
+                model=self._model_name,
+                contents=prompt,
+                config=self._generation_config,
+            ),
+            timeout=settings.gemini_timeout_seconds,
         )
 
     async def self_check(self) -> None:
-        """Used by /health/gemini — makes ONE minimal real API call to
-        prove the API key and model actually work. Deliberately NOT
-        wired into the Docker healthcheck (stays on the free /health) so
-        automatic polling doesn't burn Gemini's free-tier quota."""
         try:
             await self._client.aio.models.generate_content(
                 model=self._model_name,
@@ -94,9 +77,6 @@ Perform a complete compliance check.
 
         result = response.parsed
         if result is None:
-            # can happen if generation was truncated (max_output_tokens)
-            # or the raw output still didn't validate despite
-            # response_schema being set — rare, but not impossible
             raw_preview = (response.text or "")[:500]
             raise LLMResponseParsingError(
                 f"Gemini did not return a schema-conformant response "

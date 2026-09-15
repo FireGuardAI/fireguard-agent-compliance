@@ -6,7 +6,7 @@ services:
     container_name: fireguard-agent-compliance
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8002:8002"   # localhost only, matching the other two repos' convention
+      - "127.0.0.1:8002:8002" 
     env_file:
       - .env
     healthcheck:
@@ -17,15 +17,8 @@ services:
       start_period: 10s
     networks:
       - fireguard-net
-    # NOTE: no volumes here — unlike fireguard-vector-store and
-    # fireguard-agent-retrieval, this service never touches ChromaDB,
-    # the sparse index, or any local model files directly. It only
-    # talks HTTP to fireguard-agent-retrieval and to the Gemini API.
 
 networks:
   fireguard-net:
     external: true
-    # same network fireguard-vector-store's docker-compose.yml creates.
-    # If your fireguard-vector-store folder isn't named exactly that,
-    # check `docker network ls` and update this to match.
     name: fireguard-vector-store_fireguard-net
