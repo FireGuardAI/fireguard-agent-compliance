@@ -34,3 +34,7 @@ class ComplianceResponse(BaseModel):
     compliance_score: float = Field(..., ge=0.0, le=100.0)
     detailed_checks: list[ComplianceRuleCheck]
     summary: str
+
+
+class AuditRequest(BaseModel):
+    building_details: BuildingContext

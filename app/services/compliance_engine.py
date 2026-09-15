@@ -1,21 +1,24 @@
 """Gemini-based compliance reasoning engine.
 
-Retries transient Gemini API failures (rate limits, transient network
-errors) with exponential backoff via tenacity — the reference doc listed
-tenacity specifically for "Gemini API rate limit auto-retry" but never
-wired it in anywhere; fixed here.
+Uses the current `google-genai` SDK — NOT the deprecated `google-
+generativeai` package this file originally used. The new SDK accepts a
+Pydantic model directly as `response_schema`, which makes Gemini
+actually CONFORM to ComplianceResponse's shape (every required field
+present), rather than relying on prompt instructions alone and hoping.
 
-Response parsing is defensive: Gemini's response_mime_type="application/
-json" is a strong hint, not a guarantee. Malformed JSON or a response
-that doesn't match ComplianceResponse's schema raises a clean
-LLMResponseParsingError instead of an uncaught JSONDecodeError/
-ValidationError bubbling up as a raw, detail-leaking 500 (reference doc
-Bug 3/4).
+This fixes a real failure hit in testing: with only prompt-level
+guidance, Gemini returned a partial object (just `overall_status`) when
+it decided the answer was "insufficient data" — dropping
+compliance_score/detailed_checks/summary entirely. Schema-enforced
+output can't do that; the SDK validates the shape server-side.
+
+Retries transient Gemini API failures (rate limits, transient network
+errors) with exponential backoff via tenacity.
 """
 import json
 
-import google.generativeai as genai
-from pydantic import ValidationError
+from google import genai
+from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
@@ -29,64 +32,39 @@ logger = get_logger(__name__)
 
 class ComplianceEngine:
     def __init__(self):
-        # genai.configure() is process-global state — called here, in
-        # __init__, invoked once at API startup (see main.py). The
-        # reference doc called this AND instantiated the model at
-        # *module import time*, meaning a bad/missing API key crashed
-        # the app before it could even report a clean startup error.
-        genai.configure(api_key=settings.gemini_api_key)
-        logger.info(f"Loading Gemini model: {settings.gemini_model_name}")
-        self._model = genai.GenerativeModel(
-            model_name=settings.gemini_model_name,
+        self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._model_name = settings.gemini_model_name
+        self._generation_config = types.GenerateContentConfig(
             system_instruction=COMPLIANCE_SYSTEM_PROMPT,
-            generation_config={"response_mime_type": "application/json"},
+            response_mime_type="application/json",
+            response_schema=ComplianceResponse,
         )
-        logger.info("ComplianceEngine ready")
+        logger.info(f"ComplianceEngine ready (model={self._model_name})")
 
     @retry(
         stop=stop_after_attempt(settings.gemini_max_retries),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
-    async def _generate(self, prompt: str) -> str:
-        response = await self._model.generate_content_async(prompt)
-        return response.text
+    async def _generate(self, prompt: str):
+        return await self._client.aio.models.generate_content(
+            model=self._model_name,
+            contents=prompt,
+            config=self._generation_config,
+        )
 
     async def self_check(self) -> None:
         """Used by /health/gemini — makes ONE minimal real API call to
-        prove the API key and model name actually work, not just that
-        the client object was constructed. Deliberately NOT wired into
-        the Docker healthcheck (which stays on the free /health) so
+        prove the API key and model actually work. Deliberately NOT
+        wired into the Docker healthcheck (stays on the free /health) so
         automatic polling doesn't burn Gemini's free-tier quota."""
         try:
-            await self._model.generate_content_async("Respond with exactly: OK")
+            await self._client.aio.models.generate_content(
+                model=self._model_name,
+                contents="Respond with exactly: OK",
+            )
         except Exception as exc:
             raise ComplianceEngineError(f"Gemini self-check failed: {exc}") from exc
-
-    @staticmethod
-    def _parse_response(raw_text: str) -> ComplianceResponse:
-        text = raw_text.strip()
-        # defensive: strip markdown code fences if the model added them
-        # despite response_mime_type="application/json"
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise LLMResponseParsingError(
-                f"Gemini did not return valid JSON: {exc}"
-            ) from exc
-
-        try:
-            return ComplianceResponse(**parsed)
-        except ValidationError as exc:
-            raise LLMResponseParsingError(
-                f"Gemini's JSON didn't match the expected schema: {exc}"
-            ) from exc
 
     async def analyze(
         self, building_info: dict, retrieved_chunks: list[dict]
@@ -103,15 +81,25 @@ class ComplianceEngine:
 [FIRE REGULATION CONTEXT]
 {context_str}
 
-Perform a complete compliance check and output strictly valid JSON.
+Perform a complete compliance check.
 """
 
         try:
-            raw_text = await self._generate(prompt)
+            response = await self._generate(prompt)
         except Exception as exc:
             raise ComplianceEngineError(
                 f"Gemini API call failed after {settings.gemini_max_retries} "
                 f"attempts: {exc}"
             ) from exc
 
-        return self._parse_response(raw_text)
+        result = response.parsed
+        if result is None:
+            # can happen if generation was truncated (max_output_tokens)
+            # or the raw output still didn't validate despite
+            # response_schema being set — rare, but not impossible
+            raw_preview = (response.text or "")[:500]
+            raise LLMResponseParsingError(
+                f"Gemini did not return a schema-conformant response "
+                f"(raw text preview: {raw_preview!r})"
+            )
+        return result
