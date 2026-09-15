@@ -8,8 +8,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.exceptions import ComplianceEngineError, RetrievalClientError
+from app.exceptions import ComplianceEngineError, LLMResponseParsingError, RetrievalClientError
 from app.logger import get_logger
+from app.schemas import AuditRequest, ComplianceResponse
 from app.services.compliance_engine import ComplianceEngine
 from app.services.retrieval_client import RetrievalClient
 
@@ -66,6 +67,51 @@ async def health_gemini() -> dict:
     except ComplianceEngineError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"status": "ok", "model": settings.gemini_model_name}
+
+
+@app.post("/api/v1/audit", response_model=ComplianceResponse)
+async def run_compliance_audit(request: AuditRequest) -> ComplianceResponse:
+    """Fetches relevant regulations and asks Gemini for a compliance
+    verdict. Each failure mode gets its own status code and a clean
+    message — the reference doc caught every possible failure with one
+    blanket `except Exception: raise HTTPException(500, str(e))`, which
+    leaked raw internal exception text and couldn't distinguish "our
+    retrieval agent is down" from "Gemini returned garbage" from
+    "nothing relevant was found"."""
+    if retrieval_client is None or compliance_engine is None:
+        raise HTTPException(status_code=503, detail="Services not initialized")
+
+    query = (
+        f"Fire regulations for {request.building_details.building_type} "
+        f"with {request.building_details.number_of_floors} floors"
+    )
+
+    try:
+        retrieved_chunks = await retrieval_client.get_relevant_chunks(query)
+    except RetrievalClientError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Could not fetch regulations: {exc}"
+        ) from exc
+
+    if not retrieved_chunks:
+        raise HTTPException(
+            status_code=422,
+            detail="No relevant fire regulations found for this building type",
+        )
+
+    try:
+        return await compliance_engine.analyze(
+            building_info=request.building_details.model_dump(),
+            retrieved_chunks=retrieved_chunks,
+        )
+    except LLMResponseParsingError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Gemini returned an unusable response: {exc}"
+        ) from exc
+    except ComplianceEngineError as exc:
+        raise HTTPException(
+            status_code=503, detail=f"Compliance engine failed: {exc}"
+        ) from exc
 
 
 @app.on_event("startup")

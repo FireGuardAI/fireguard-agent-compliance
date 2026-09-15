@@ -12,7 +12,7 @@ clause).
       Dockerized + joined to `fireguard-vector-store`'s Docker network
 - [x] **Step 2** — Retrieval client (`httpx` + real `tenacity` retries), `/health/retrieval`
 - [x] **Step 3** — Compliance engine (Gemini integration), `/health/gemini`
-- [ ] Step 4 — `/api/v1/audit` endpoint
+- [x] **Step 4** — `/api/v1/audit` endpoint
 - [ ] Step 5 — Production hardening (optional)
 
 ## Prerequisites
@@ -98,7 +98,8 @@ inspect fireguard-vector-store_fireguard-net`).
 
 ## Step 3 — Compliance engine (Gemini)
 
-`app/services/compliance_engine.py` — fixes two reference-doc bugs:
+`app/services/compliance_engine.py` — fixes three bugs, one found during
+initial reference-doc review, two found through actual testing:
 
 1. **Import-time instantiation** (`engine = ComplianceEngine()` at module
    load) meant a missing/bad API key crashed the app before it could
@@ -107,11 +108,17 @@ inspect fireguard-vector-store_fireguard-net`).
 2. **`tenacity` was listed as a dependency but never used.** Now the
    actual Gemini API call retries transient failures (rate limits,
    network errors) with exponential backoff.
+3. **(Found via live testing) Gemini returned a partial JSON object**
+   (only `overall_status`, missing `compliance_score`/`detailed_checks`/
+   `summary`) when relying on prompt-only schema instructions with the
+   deprecated `google-generativeai` SDK. Fixed by migrating to the
+   current `google-genai` SDK, which accepts the `ComplianceResponse`
+   Pydantic model directly as `response_schema` — Gemini's output is
+   then schema-enforced server-side, not just prompt-requested.
 
-Response parsing is defensive: `json.loads()` and the Pydantic
-`ComplianceResponse` validation are both wrapped, raising a clean
-`LLMResponseParsingError` instead of an uncaught crash if Gemini's
-output isn't valid JSON or doesn't match the schema.
+Response parsing still has a defensive fallback: `response.parsed` can
+be `None` if generation was truncated, in which case a clean
+`LLMResponseParsingError` is raised instead of a crash.
 
 ```powershell
 docker compose up -d --build
@@ -125,3 +132,40 @@ Expected:
 
 This makes one real (tiny) Gemini API call — don't script it into a
 tight polling loop, Gemini's free tier is rate-limited.
+
+## Step 4 — Full audit (`/api/v1/audit`)
+
+Wires retrieval + compliance engine together. Fixes the reference doc's
+blanket `except Exception: raise HTTPException(500, str(e))`, which
+couldn't distinguish "retrieval agent is down" from "Gemini returned
+garbage" from "no relevant regulations found" — each now gets its own
+status code:
+
+| Failure | Status | Meaning |
+|---|---|---|
+| Services not initialized | 503 | Shouldn't happen post-startup |
+| Retrieval agent unreachable | 502 | Upstream dependency down |
+| No chunks found for the query | 422 | Nothing relevant to check against |
+| Gemini response unparseable | 502 | LLM didn't return valid/matching JSON |
+| Gemini API call failed | 503 | Upstream LLM service issue |
+
+```powershell
+docker compose up -d --build
+```
+
+```powershell
+$body = @{
+    building_details = @{
+        building_type = "Commercial"
+        number_of_floors = 5
+        has_extinguishers = $true
+        extinguisher_details = "ABC type, 5kg, one per floor near stairwell"
+    }
+} | ConvertTo-Json
+Invoke-RestMethod -Uri "http://localhost:8002/api/v1/audit" -Method Post -Body $body -ContentType "application/json"
+```
+
+Expected: a JSON object with `overall_status`, `compliance_score`,
+`detailed_checks` (each citing a `rule_clause` from the retrieved
+regulation chunks), and `summary`. This call chains all three services
+(retrieval → Gemini) and typically takes a few seconds.
