@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     retrieval_service_url: str = Field(default="http://agent-retrieval:8001")
     retrieval_top_k: int = Field(default=5, gt=0)
     retrieval_timeout_seconds: float = Field(default=10.0, gt=0)
+    retrieval_max_retries: int = Field(default=3, ge=0)
 
     # Gemini LLM connection (Step 3) — required, no default
     gemini_api_key: str

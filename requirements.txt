@@ -1,11 +1,14 @@
-# Step 1: API skeleton only.
-# Step 2 adds httpx + tenacity (retrieval agent client, with real retries).
-# Step 3 adds google-generativeai (Gemini integration).
-# No ML/embedding libraries needed anywhere in this repo — the LLM call
-# is a remote API, not a locally-loaded model, so unlike the other two
-# repos there's no CPU-only-torch fix or HF model cache to worry about.
-
+# Step 1: API skeleton
 fastapi>=0.110.0,<0.120.0
 uvicorn[standard]>=0.28.0,<0.30.0
 pydantic>=2.6.0,<3.0.0
 pydantic-settings>=2.2.0,<3.0.0
+
+# Step 2: Retrieval client
+httpx>=0.27.0,<0.28.0
+tenacity>=8.2.0,<9.0.0
+
+# Step 3 adds google-generativeai (Gemini integration).
+# No ML/embedding libraries needed anywhere in this repo — the LLM call
+# is a remote API, not a locally-loaded model, so unlike the other two
+# repos there's no CPU-only-torch fix or HF model cache to worry about.
