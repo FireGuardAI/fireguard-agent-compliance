@@ -8,8 +8,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.exceptions import RetrievalClientError
+from app.exceptions import ComplianceEngineError, RetrievalClientError
 from app.logger import get_logger
+from app.services.compliance_engine import ComplianceEngine
 from app.services.retrieval_client import RetrievalClient
 
 logger = get_logger(__name__)
@@ -25,6 +26,7 @@ app.add_middleware(
 
 # Loaded once at startup (see on_startup below), never per-request.
 retrieval_client: RetrievalClient | None = None
+compliance_engine: ComplianceEngine | None = None
 
 
 @app.get("/health")
@@ -50,8 +52,25 @@ async def health_retrieval() -> dict:
     return {"status": "ok", "retrieval_agent": upstream_health}
 
 
+@app.get("/health/gemini")
+async def health_gemini() -> dict:
+    """Makes one real (minimal) Gemini API call to prove the API key and
+    model actually work. Not polled automatically — call it manually,
+    it costs a tiny sliver of free-tier quota each time."""
+    if compliance_engine is None:
+        raise HTTPException(
+            status_code=503, detail="Compliance engine not initialized"
+        )
+    try:
+        await compliance_engine.self_check()
+    except ComplianceEngineError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "ok", "model": settings.gemini_model_name}
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
-    global retrieval_client
+    global retrieval_client, compliance_engine
     logger.info(f"{settings.api_title} v{settings.api_version} starting up")
     retrieval_client = RetrievalClient()
+    compliance_engine = ComplianceEngine()
